@@ -1,0 +1,19 @@
+[package]
+name = "server"
+description = "HTTP/WebSocket API (week 3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "uav-geo-backend"
+path = "src/main.rs"
+
+[dependencies]
+geo-core.workspace = true
+telemetry.workspace = true
+
+[lints]
+workspace = true
