@@ -1,4 +1,14 @@
 //! `GET /live`: WebSocket stream of live positions and link changes.
+//!
+//! Every connection subscribes to the ingest task's `broadcast` channel and
+//! forwards matching messages as JSON text frames. Filters (`system_id`,
+//! `bbox`) are applied per connection on the server, so a map showing one
+//! area does not receive the whole fleet.
+//!
+//! `broadcast` gives each subscriber its own read position in a shared ring
+//! buffer. A client that reads too slowly falls behind, gets `Lagged(n)`,
+//! and continues with the newest messages. Ingestion is never slowed down by
+//! a slow browser.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Query, State};
@@ -54,11 +64,15 @@ pub async fn live(
         system_id: q.system_id,
         bbox,
     };
+    // Validation happens before the upgrade, so a bad bbox is a normal HTTP
+    // 400 instead of a WebSocket that closes immediately.
     Ok(ws.on_upgrade(move |socket| stream(socket, state, filter)))
 }
 
 async fn stream(socket: WebSocket, state: AppState, filter: Filter) {
     let mut rx = state.live.subscribe();
+    // Split into send and receive halves so we can wait on both at once:
+    // outgoing live messages and incoming close frames.
     let (mut sink, mut incoming) = socket.split();
     let shutdown = state.shutdown.clone();
     loop {

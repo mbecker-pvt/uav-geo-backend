@@ -1,4 +1,20 @@
 //! Missions and their validation against a geofence and terrain clearance.
+//!
+//! `POST /missions` parses the GeoJSON body into a [`Mission`], builds
+//! [`MissionRules`] from the active geofence, the loaded DEM and `MIN_AGL_M`,
+//! and calls [`Mission::validate`]. Only a mission without violations is
+//! stored, and only a stored mission can be uploaded to the vehicle. So this
+//! module is the safety gate between "someone drew a line on a map" and "the
+//! drone flies it".
+//!
+//! The rules, in order:
+//!
+//! 1. not empty and at most [`MAX_WAYPOINTS`] (hard stop, nothing else is
+//!    checked: there is nothing sensible to report on a 10 000-point mission),
+//! 2. every waypoint inside the geofence,
+//! 3. every straight leg inside the geofence,
+//! 4. every leg, sampled every `sample_spacing_m`, at least `min_agl_m`
+//!    above the terrain. Missing terrain data fails the check (fail safe).
 
 use serde::Serialize;
 
@@ -16,6 +32,9 @@ pub struct Mission {
 }
 
 /// Validation parameters.
+///
+/// Borrowed references, so the server can pass its shared (`Arc`) fence and
+/// DEM without cloning them per request.
 #[derive(Clone, Copy)]
 pub struct MissionRules<'a> {
     /// Inclusion fence; `None` disables the fence check.
@@ -28,6 +47,8 @@ pub struct MissionRules<'a> {
     pub sample_spacing_m: f64,
 }
 
+// Manual `Debug`: `dyn TerrainSource` has no `Debug`, and printing a whole
+// polygon or DEM into logs would be useless anyway.
 impl std::fmt::Debug for MissionRules<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MissionRules")
@@ -40,6 +61,11 @@ impl std::fmt::Debug for MissionRules<'_> {
 }
 
 /// A single rule violation.
+///
+/// Serialised with an internal `"kind"` tag, e.g.
+/// `{"kind": "leaves_geofence", "segment": 2}`, and returned as-is in the
+/// `422` response body, so a client can highlight the offending waypoint or
+/// leg on a map. Segment `i` is the leg from waypoint `i` to `i + 1`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Violation {
@@ -92,6 +118,10 @@ impl Mission {
                     violations.push(Violation::OutsideGeofence { waypoint: i });
                 }
             }
+            // `windows(2)` yields each leg (wp[i], wp[i+1]). A leg with an
+            // endpoint outside is already reported above, so only legs whose
+            // two ends are inside are checked for leaving the fence; that
+            // avoids two violations for one problem.
             for (i, pair) in wps.windows(2).enumerate() {
                 if fence.contains(&pair[0])
                     && fence.contains(&pair[1])
@@ -103,6 +133,7 @@ impl Mission {
         }
 
         if let Some(terrain) = rules.terrain {
+            // A single waypoint has no legs, so check the point itself.
             if wps.len() == 1 {
                 check_clearance(terrain, rules.min_agl_m, None, &wps[0], &mut violations);
             }
@@ -135,6 +166,7 @@ fn check_clearance(
 ) -> bool {
     match terrain.agl_m(p) {
         Some(agl_m) if agl_m >= min_agl_m => false,
+        // Too low: this is the ridge-between-two-valid-waypoints case.
         Some(agl_m) => {
             out.push(Violation::BelowMinAgl {
                 segment,
@@ -144,6 +176,8 @@ fn check_clearance(
             });
             true
         }
+        // Outside the DEM or a nodata pixel: we cannot prove the leg is safe,
+        // so reject it instead of silently passing.
         None => {
             out.push(Violation::NoTerrainData { segment, at: *p });
             true
@@ -165,7 +199,9 @@ pub fn sample_segment(a: &Position, b: &Position, spacing_m: f64) -> Vec<Positio
     ) else {
         return vec![*a, *b];
     };
+    // Leg length in metres (planar, inside one UTM zone).
     let length = (ub.easting - ua.easting).hypot(ub.northing - ua.northing);
+    // Invalid spacing → just the two end points.
     let spacing = if spacing_m.is_finite() && spacing_m > 0.0 {
         spacing_m
     } else {
@@ -180,12 +216,16 @@ pub fn sample_segment(a: &Position, b: &Position, spacing_m: f64) -> Vec<Positio
         .map(|i| {
             #[allow(clippy::cast_precision_loss)]
             let t = i as f64 / steps_f;
+            // Return the exact end points instead of round-tripping them
+            // through UTM, so waypoint samples match the waypoints bit for bit.
             if i == 0 {
                 return *a;
             }
             if i == steps {
                 return *b;
             }
+            // Linear interpolation on the map (the vehicle flies a straight
+            // line between waypoints) and in altitude (it climbs steadily).
             let mut u = ua;
             u.easting += (ub.easting - ua.easting) * t;
             u.northing += (ub.northing - ua.northing) * t;

@@ -1,4 +1,18 @@
 //! Pure decoding of MAVLink messages into [`TelemetryEvent`]s (no I/O).
+//!
+//! An autopilot sends dozens of message types. The backend only needs two:
+//!
+//! - `HEARTBEAT` (1 Hz): "I am alive", plus vehicle type, autopilot and the
+//!   armed flag. Drives the vehicle list and link-loss detection.
+//! - `GLOBAL_POSITION_INT` (up to 50 Hz): the fused GNSS/IMU position.
+//!   Becomes a stored track point and a live WebSocket message.
+//!
+//! Everything else returns `None` here and is only seen by subscribers of the
+//! raw broadcast (the mission upload).
+//!
+//! MAVLink sends integers to save bandwidth; the conversions are:
+//! lat/lon degE7 → degrees (`/ 1e7`), altitudes mm → m (`/ 1000`),
+//! velocities cm/s → m/s (`/ 100`), heading cdeg → degrees (`/ 100`).
 
 use chrono::{DateTime, Utc};
 use geo_core::{Position, PositionError};
@@ -48,6 +62,10 @@ pub struct PositionReport {
     /// Milliseconds since autopilot boot.
     pub time_boot_ms: u32,
     /// Wall-clock time the message was received by the backend.
+    ///
+    /// This, not `time_boot_ms`, is the row's `time` in the database: the
+    /// boot clock restarts with every reboot of the autopilot, so it cannot
+    /// order points across flights.
     pub received_at: DateTime<Utc>,
     /// WGS84 position, altitude above mean sea level.
     pub position: Position,
@@ -107,6 +125,9 @@ fn decode_heartbeat(
     hb: &HEARTBEAT_DATA,
     received_at: DateTime<Utc>,
 ) -> Option<TelemetryEvent> {
+    // Ground stations, cameras, gimbals etc. also send heartbeats, with
+    // autopilot = INVALID. Only the flight controller describes the vehicle;
+    // without this filter a camera heartbeat would overwrite the vehicle type.
     if hb.autopilot == MavAutopilot::MAV_AUTOPILOT_INVALID || hb.mavtype == MavType::MAV_TYPE_GCS {
         return None;
     }
@@ -128,6 +149,8 @@ fn decode_position(
     gp: &GLOBAL_POSITION_INT_DATA,
     received_at: DateTime<Utc>,
 ) -> Option<TelemetryEvent> {
+    // Before the first GNSS fix, autopilots report 0/0 ("Null Island" in the
+    // Gulf of Guinea). Storing those would draw a line across half the globe.
     if gp.lat == 0 && gp.lon == 0 {
         tracing::trace!(system_id, "position without fix ignored");
         return None;
@@ -151,10 +174,13 @@ fn decode_position(
             f64::from(gp.vy) / 100.0,
             f64::from(gp.vz) / 100.0,
         ],
+        // UINT16_MAX is MAVLink's "unknown" marker for the heading.
         heading_deg: (gp.hdg != u16::MAX).then(|| f64::from(gp.hdg) / 100.0),
     }))
 }
 
+/// `MAV_TYPE_QUADROTOR` → `QUADROTOR`. The generated MAVLink enums have no
+/// name accessor, but their `Debug` output is the variant name.
 fn enum_name<T: std::fmt::Debug>(value: &T, prefix: &str) -> String {
     let s = format!("{value:?}");
     s.strip_prefix(prefix)

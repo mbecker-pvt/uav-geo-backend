@@ -1,4 +1,15 @@
 //! Shared application state and live messages.
+//!
+//! [`AppState`] is cloned into every axum handler. All fields are cheap to
+//! clone (`Arc`s, pool handles, channel senders), so a clone per request
+//! costs a few reference-count increments.
+//!
+//! Two sources of truth exist on purpose:
+//!
+//! - the **database** for history (tracks, vehicles ever seen, missions),
+//! - the **in-memory** `vehicles` map for "right now" (link state, armed,
+//!   last position). It is written by the ingest task and would be stale or
+//!   pointless to store at 50 Hz.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -17,6 +28,9 @@ use crate::buffer::BufferStats;
 pub const LIVE_CHANNEL_CAPACITY: usize = 1024;
 
 /// A message pushed to WebSocket clients.
+///
+/// JSON with a `"type"` tag: `{"type": "position", ...}` or
+/// `{"type": "link", "system_id": 1, "state": "lost"}`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum LiveMessage {
@@ -64,11 +78,17 @@ pub struct VehicleStatus {
 #[derive(Clone)]
 pub struct AppState {
     pub db: Db,
+    /// Sender side of the live feed; each WebSocket calls `subscribe()`.
     pub live: broadcast::Sender<LiveMessage>,
+    /// Live status per system id. `RwLock`: many readers (`GET /vehicles`),
+    /// one writer (ingest).
     pub vehicles: Arc<RwLock<BTreeMap<u8, VehicleStatus>>>,
+    /// Loaded DEM, `None` without `DEM_PATH` (AGL is then `null`).
     pub terrain: Option<Arc<dyn TerrainSource>>,
     /// Fallback geofence from `GEOFENCE_PATH` if none is active in the DB.
     pub default_geofence: Option<Arc<Geofence>>,
+    /// MAVLink connection for mission upload. `Option` so API tests can run
+    /// without a socket (upload then answers 503).
     pub link: Option<MavLink>,
     pub buffer_stats: Arc<BufferStats>,
     pub min_agl_m: f64,

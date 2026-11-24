@@ -1,4 +1,17 @@
 //! Heartbeat-based link loss detection (pure, clock passed in).
+//!
+//! MAVLink has no "disconnect" message: UDP is connectionless, and a drone
+//! that flies out of radio range simply goes quiet. The convention is that
+//! every system sends a `HEARTBEAT` at 1 Hz, and a peer counts as lost after
+//! a few missed heartbeats (`LINK_TIMEOUT_S`, default 3 s).
+//!
+//! The server's ingest task calls [`LinkMonitor::heartbeat`] for every
+//! heartbeat and [`LinkMonitor::check`] on a 500 ms timer. Both return only
+//! *transitions*, which become `{"type": "link", ...}` WebSocket messages, so
+//! clients are told once ("lost") instead of on every tick.
+//!
+//! Taking `now` as a parameter instead of calling `Instant::now()` inside
+//! keeps the logic deterministic: tests step the clock by hand.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -43,6 +56,8 @@ impl LinkMonitor {
             .vehicles
             .insert(system_id, (now, LinkState::Connected))
             .map(|(_, s)| s);
+        // `None` (first heartbeat ever) or `Some(Lost)` (link recovered) are
+        // transitions; `Some(Connected)` is just the normal 1 Hz tick.
         (previous != Some(LinkState::Connected)).then_some(LinkChange {
             system_id,
             state: LinkState::Connected,
@@ -53,6 +68,8 @@ impl LinkMonitor {
     pub fn check(&mut self, now: Instant) -> Vec<LinkChange> {
         let mut changes = Vec::new();
         for (&system_id, (last, state)) in &mut self.vehicles {
+            // Only Connected → Lost is a transition; an already lost vehicle
+            // stays lost silently until its next heartbeat.
             if *state == LinkState::Connected && now.duration_since(*last) > self.timeout {
                 *state = LinkState::Lost;
                 changes.push(LinkChange {

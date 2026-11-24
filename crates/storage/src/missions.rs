@@ -1,4 +1,17 @@
 //! Geofences and missions.
+//!
+//! Geometries are written as WKT text (`POLYGON((lon lat, ...))`,
+//! `MULTIPOINT Z ((lon lat alt), ...)`) and parsed by `ST_GeomFromText`.
+//! They are read back point by point with `ST_DumpPoints ... ORDER BY path`,
+//! which returns vertices in their stored order, so waypoint order survives
+//! the round trip.
+//!
+//! Mission lifecycle (the `status` column):
+//!
+//! ```text
+//! validated ──upload──▶ uploading ──ACK──▶ uploaded
+//!                           └──timeout/reject──▶ failed ──upload again──▶ uploading
+//! ```
 
 use std::fmt::Write as _;
 
@@ -88,6 +101,9 @@ impl Db {
     /// # Errors
     /// Returns an error on database failure.
     pub async fn create_geofence(&self, fence: &Geofence) -> Result<i32> {
+        // Deactivate the old fence and insert the new one in one transaction:
+        // the partial unique index (`WHERE active`) would reject a second
+        // active row, and no reader ever sees "no fence" in between.
         let mut tx = self.pool().begin().await?;
         sqlx::query("UPDATE geofences SET active = false WHERE active")
             .execute(&mut *tx)
@@ -137,6 +153,8 @@ impl Db {
     /// # Errors
     /// Returns an error on database failure.
     pub async fn insert_mission(&self, mission: &Mission) -> Result<Uuid> {
+        // Random UUIDs (not serial ids) so mission ids cannot be guessed or
+        // enumerated through the API.
         let id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO missions (id, system_id, waypoints, status)
@@ -194,6 +212,10 @@ impl Db {
     /// # Errors
     /// Returns an error on database failure.
     pub async fn begin_mission_upload(&self, id: Uuid) -> Result<bool> {
+        // Check and set in one statement ("compare-and-swap"). Two parallel
+        // POST /upload requests cannot both see "not uploading": Postgres
+        // row locking lets only one UPDATE match. A SELECT followed by an
+        // UPDATE would race.
         let updated = sqlx::query(
             "UPDATE missions SET status = 'uploading', status_detail = NULL
              WHERE id = $1 AND status <> 'uploading'",

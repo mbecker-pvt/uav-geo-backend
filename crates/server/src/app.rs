@@ -8,6 +8,16 @@
 //! Shutdown order (one `CancellationToken`): HTTP stops accepting and drains,
 //! WebSockets close, the receive loop and ingest stop, the write buffer does a
 //! final flush (bounded), then the pool closes.
+//!
+//! Every long-running part is its own `tokio` task connected by channels.
+//! Channels are bounded, so a slow consumer slows its producer down instead
+//! of growing memory without limit; the one exception is the live broadcast,
+//! where slow WebSocket clients skip messages instead (see `api::ws`).
+//!
+//! Startup fails fast on configuration problems (bad DEM, port in use), but
+//! deliberately **not** on a missing database: telemetry is the data that
+//! cannot be re-sent later, so the service starts, buffers it and keeps
+//! retrying the database in the background.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -81,6 +91,8 @@ fn spawn_migrations(db: Db, cancel: CancellationToken) -> JoinHandle<()> {
                 }
                 Err(e) => tracing::warn!(error = %e, "database not ready, retrying migrations"),
             }
+            // Exponential backoff 0.5 s → 1 → 2 → ... → 10 s, interruptible
+            // by shutdown.
             tokio::select! {
                 () = cancel.cancelled() => return,
                 () = tokio::time::sleep(delay) => {}
@@ -96,12 +108,18 @@ fn spawn_migrations(db: Db, cancel: CancellationToken) -> JoinHandle<()> {
 /// Fails if the DEM, geofence file, MAVLink address or HTTP address cannot be
 /// used. A database outage is **not** an error: it is retried.
 pub async fn start(config: Config) -> anyhow::Result<Running> {
+    // One token for the whole app; cancelling it starts the shutdown.
     let shutdown = CancellationToken::new();
+    // Lazy: no connection is opened here, so a down database does not stop
+    // startup (only an unparsable URL does).
     let db = Db::connect_lazy(&config.database_url, 10).context("invalid DATABASE_URL")?;
 
     let terrain = match &config.dem_path {
         Some(p) => {
             let p = p.clone();
+            // Decoding a 50 MB GeoTIFF is CPU-bound, blocking file I/O; run it
+            // on the blocking pool so it does not stall the async runtime.
+            // `??`: first for the task join error, then for the load error.
             Some(tokio::task::spawn_blocking(move || load_terrain(&p)).await??)
         }
         None => None,
@@ -113,6 +131,8 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
         .transpose()?
         .map(Arc::new);
 
+    // Bind both sockets before spawning anything, so "port in use" is a
+    // startup error, not a log line from a background task.
     let link = MavLink::connect(&config.mavlink_addr).await?;
     tracing::info!(addr = %config.mavlink_addr, "MAVLink listening");
     let listener = TcpListener::bind(config.http_addr)
@@ -138,6 +158,9 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
     // The write buffer gets its own token so it outlives the producers and
     // can drain everything they sent.
     let writer_cancel = CancellationToken::new();
+    // Receive loop → ingest (decoded events), ingest → writer (rows to store).
+    // Sizes are a few seconds of 50 Hz telemetry; the writer has its own,
+    // much larger, in-memory buffer for database outages.
     let (event_tx, event_rx) = mpsc::channel(1024);
     let (row_tx, row_rx) = mpsc::channel(4096);
 
@@ -173,7 +196,9 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
             }
         }
     });
-    // Stop the writer only after the producers have finished.
+    // Stop the writer only after the producers have finished. If the writer
+    // stopped together with them, positions still in the channels at that
+    // moment would be lost; this way it drains everything first.
     let writer_stop = tokio::spawn({
         let cancel = shutdown.clone();
         async move {
@@ -199,6 +224,8 @@ pub async fn start(config: Config) -> anyhow::Result<Running> {
 
 /// Resolves on Ctrl-C, or SIGTERM on Unix (e.g. `docker stop`).
 pub async fn shutdown_signal() {
+    // If a signal handler cannot be installed, wait forever on that branch
+    // instead of resolving, which would shut the service down immediately.
     let ctrl_c = async {
         if let Err(e) = tokio::signal::ctrl_c().await {
             tracing::error!(error = %e, "cannot listen for Ctrl-C");

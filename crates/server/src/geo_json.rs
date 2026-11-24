@@ -1,4 +1,13 @@
 //! GeoJSON conversions for API input and output.
+//!
+//! GeoJSON (RFC 7946) is what map tools (geojson.io, Leaflet, QGIS) read and
+//! write, so the API speaks it at the edges while the rest of the code uses
+//! the `geo-core` types. Note the axis order: GeoJSON is `[lon, lat, alt]`,
+//! [`Position::new`] takes `(lat, lon, alt)`; every swap happens in this file.
+//!
+//! Input parsing is deliberately lenient about the container (bare geometry,
+//! `Feature`, `FeatureCollection`) and strict about the content (every
+//! waypoint needs an altitude, fences must be simple polygons).
 
 use geo_core::{Geofence, Position};
 use geojson::{Feature, FeatureCollection, GeoJson, Geometry, GeometryValue, JsonObject};
@@ -94,6 +103,8 @@ fn parse_geojson(value: &Value) -> Result<GeoJson, GeoJsonError> {
 }
 
 fn waypoint(coords: &[f64], index: usize) -> Result<Position, GeoJsonError> {
+    // The altitude is mandatory: a 2D waypoint would leave the flight height
+    // undefined, and the AGL check could not run.
     let &[lon, lat, alt, ..] = coords else {
         return Err(err(format!(
             "waypoint {index}: coordinates must be [lon, lat, alt_amsl]"
@@ -181,6 +192,9 @@ pub fn parse_geofence(value: &Value) -> Result<Geofence, GeoJsonError> {
             geometry.value.type_name()
         )));
     };
+    // GeoJSON polygon = [exterior ring, hole 1, hole 2, ...]. Holes (no-fly
+    // islands inside the fence) are not modelled, so reject them rather
+    // than silently ignore them.
     let [exterior] = coordinates.as_slice() else {
         return Err(err(
             "geofence polygon must have exactly one ring (no holes)",

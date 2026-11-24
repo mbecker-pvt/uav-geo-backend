@@ -4,6 +4,24 @@
 //! coordinates (e.g. Copernicus GLO-30, SRTM), any integer or float sample
 //! type, tiled or stripped, GDAL nodata. Elevations are bilinearly
 //! interpolated between pixel centres.
+//!
+//! A DEM (digital elevation model) is a grid of ground heights. A GeoTIFF is
+//! a normal TIFF image whose "pixels" are heights, plus tags that say where
+//! on Earth the grid is:
+//!
+//! - `ModelTiepoint`: pixel (i, j) ↔ coordinate (x, y), usually the top-left
+//!   corner,
+//! - `ModelPixelScale`: pixel size in degrees,
+//! - `GeoKeyDirectory`: the coordinate system (we accept EPSG:4326/4258),
+//! - `GDAL_NODATA`: the value that marks "no data" (sea, voids).
+//!
+//! With those, a lat/lon maps to a fractional pixel position by simple
+//! division (see [`GeoTiffDem::elevation`]). The whole raster is loaded into
+//! memory as `f32`: a Copernicus GLO-30 tile (3600 × 3600) is ~50 MB, and
+//! lookups are then a few array reads, fast enough for 50 Hz live AGL.
+//!
+//! Used for two things: `agl_m` on live positions and tracks, and the
+//! minimum-AGL check in mission validation (via `geo_core::TerrainSource`).
 
 use std::fs::File;
 use std::io::{BufReader, Read, Seek};
@@ -89,6 +107,9 @@ impl GeoTiffDem {
         let (width, height) = decoder.dimensions()?;
         let (width, height) = (width as usize, height as usize);
 
+        // Georeferencing: either an affine ModelTransformation matrix, or a
+        // tiepoint + pixel scale (north-up grid). We support the latter only,
+        // which is what every common DEM product uses.
         if decoder.find_tag(Tag::ModelTransformationTag)?.is_some() {
             return Err(DemError::Unsupported(
                 "rotated rasters (ModelTransformation) are not supported".into(),
@@ -96,6 +117,8 @@ impl GeoTiffDem {
         }
         let scale = decoder.get_tag_f64_vec(Tag::ModelPixelScaleTag)?;
         let tie = decoder.get_tag_f64_vec(Tag::ModelTiepointTag)?;
+        // Scale = (dx, dy, dz); tiepoint = (i, j, k, x, y, z): raster point
+        // (i, j) sits at model coordinate (x = lon, y = lat).
         let (&[dx, dy, ..], &[ti, tj, _, tx, ty, ..]) = (&scale[..], &tie[..]) else {
             return Err(DemError::Unsupported(
                 "invalid pixel scale / tiepoint".into(),
@@ -105,6 +128,8 @@ impl GeoTiffDem {
             return Err(DemError::Unsupported("pixel scale must be positive".into()));
         }
 
+        // Reject projected DEMs (e.g. UTM in metres): treating metres as
+        // degrees would silently return heights from the wrong place.
         let keys = decoder.get_tag_u16_vec(Tag::GeoKeyDirectoryTag)?;
         let key = |id: u16| geo_key(&keys, id);
         if key(KEY_PROJECTED_TYPE).is_some()
@@ -120,12 +145,16 @@ impl GeoTiffDem {
             return Err(DemError::Unsupported(format!("geographic CRS EPSG:{crs}")));
         }
         // PixelIsArea (default): the tiepoint is the outer corner of the pixel.
+        // PixelIsPoint: it is the pixel centre. We store the centre of pixel
+        // (0, 0), so shift by half a pixel in the PixelIsArea case. Getting
+        // this wrong moves the whole DEM by 15 m for a 30 m raster.
         let half = if key(KEY_RASTER_TYPE) == Some(RASTER_PIXEL_IS_POINT) {
             0.0
         } else {
             0.5
         };
 
+        // GDAL stores nodata as an ASCII string (sometimes NUL-terminated).
         let nodata = decoder
             .get_tag_ascii_string(Tag::GdalNodata)
             .ok()
@@ -135,6 +164,8 @@ impl GeoTiffDem {
         if data.len() != width * height {
             return Err(DemError::Unsupported("unexpected sample count".into()));
         }
+        // Rows go north → south, so latitude decreases with the row index
+        // (hence the minus for lat0 and in `elevation`).
         Ok(Self {
             width,
             height,
@@ -153,6 +184,7 @@ impl GeoTiffDem {
         (self.width, self.height)
     }
 
+    /// One raw sample (row-major storage), `None` for nodata / NaN.
     fn value(&self, col: usize, row: usize) -> Option<f64> {
         let v = f64::from(*self.data.get(row * self.width + col)?);
         let is_nodata = v.is_nan() || self.nodata.is_some_and(|nd| (v - nd).abs() < 1e-6);
@@ -180,6 +212,9 @@ impl GeoTiffDem {
         #[allow(clippy::cast_precision_loss)]
         let (tx, ty) = (fx - c0 as f64, fy - r0 as f64);
 
+        // Bilinear interpolation: the four surrounding pixel centres,
+        // each weighted by how close the query point is to it (weights sum
+        // to 1). Without it, AGL would jump in 30 m steps along a track.
         let corners = [
             (self.value(c0, r0), (1.0 - tx) * (1.0 - ty)),
             (self.value(c1, r0), tx * (1.0 - ty)),
@@ -208,6 +243,10 @@ impl TerrainSource for GeoTiffDem {
 }
 
 /// A set of DEM tiles; the first tile with data at a location wins.
+///
+/// DEM products are cut into 1° × 1° tiles, so a flight area near a tile
+/// border needs several. Tiles are tried in file-name order; a linear scan is
+/// fine for the handful of tiles a local deployment loads.
 #[derive(Debug, Clone, Default)]
 pub struct TerrainModel {
     tiles: Vec<GeoTiffDem>,
@@ -276,6 +315,10 @@ impl TerrainSource for TerrainModel {
 }
 
 /// Looks up a short (inline) value in a `GeoKeyDirectory`.
+///
+/// Layout: a 4-value header `[version, revision, minor, key_count]`, then
+/// `key_count` entries of `[key_id, tag_location, count, value]`.
+/// `tag_location == 0` means the value is stored inline in the entry.
 fn geo_key(dir: &[u16], id: u16) -> Option<u16> {
     let count = usize::from(*dir.get(3)?);
     dir.get(4..4 + count * 4)?
@@ -285,7 +328,8 @@ fn geo_key(dir: &[u16], id: u16) -> Option<u16> {
 }
 
 fn to_f32(result: DecodingResult) -> Result<Vec<f32>, DemError> {
-    // Elevations fit f32 precision (≈ 0.1 mm at 9 km); precision loss is fine.
+    // Elevations fit f32 precision (≈ 1 mm at 9 km); precision loss is fine,
+    // and f32 halves the memory of an f64 raster.
     #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
     Ok(match result {
         DecodingResult::F32(v) => v,

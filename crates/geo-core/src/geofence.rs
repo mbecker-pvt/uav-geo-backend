@@ -1,4 +1,11 @@
 //! Polygon geofences.
+//!
+//! A geofence is the area a mission may use. It comes from the database
+//! (`POST /geofences`, the active one wins) or from `GEOFENCE_PATH` as a
+//! fallback. Mission validation checks both waypoints ([`Geofence::contains`])
+//! and the straight legs between them ([`Geofence::contains_segment`]): with a
+//! concave (e.g. L-shaped) fence, two waypoints can be inside while the leg
+//! between them cuts across the outside.
 
 use geo::{Coord, Covers, Line, LineString, Point, Polygon};
 
@@ -36,6 +43,10 @@ impl Geofence {
                 return Err(GeofenceError::InvalidVertex(i));
             }
         }
+        // GeoJSON rings repeat the first vertex at the end; drop it so the
+        // vertex count below is the number of distinct corners (`geo` closes
+        // the ring again). `dedup` removes repeated consecutive vertices,
+        // which would otherwise let a 2-corner "polygon" through.
         let mut coords: Vec<Coord<f64>> = ring.iter().map(|&(x, y)| Coord { x, y }).collect();
         if coords.len() > 1 && coords.first() == coords.last() {
             coords.pop();
@@ -63,6 +74,9 @@ impl Geofence {
     /// Whether `p` is inside or on the boundary.
     #[must_use]
     pub fn contains(&self, p: &Position) -> bool {
+        // `covers` (not `contains`): in DE-9IM terms `contains` is false for a
+        // point exactly on the edge, which would reject waypoints placed on
+        // the fence line.
         self.polygon.covers(&Point::new(p.lon, p.lat))
     }
 

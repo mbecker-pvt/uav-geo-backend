@@ -10,6 +10,16 @@
 //! ```
 //! Every step has a timeout; on timeout the last message is re-sent up to
 //! `retries` times (the vehicle re-requests lost items itself).
+//!
+//! The vehicle drives the transfer: after `MISSION_COUNT` it asks for each
+//! item by sequence number, and it may ask for the same item twice (if our
+//! reply was lost) or out of order. So the loop below does not count items;
+//! it answers whatever the vehicle requests until the vehicle sends
+//! `MISSION_ACK`. This is why a lost UDP packet costs one timeout, not the
+//! whole upload.
+//!
+//! Called from `POST /missions/{id}/upload` in a background task; the result
+//! ends up in the mission's `status` (`uploaded` / `failed`).
 
 use std::time::Duration;
 
@@ -71,8 +81,11 @@ pub fn mission_item(target_system: u8, seq: u16, wp: &Position) -> MavMessage {
         seq,
         // AMSL altitude; GLOBAL_INT is a deprecated synonym of GLOBAL.
         frame: MavFrame::MAV_FRAME_GLOBAL,
+        // A plain "fly to this point" item. Takeoff/land/loiter items could
+        // be added later; the validated route only needs waypoints.
         command: MavCmd::MAV_CMD_NAV_WAYPOINT,
         current: 0,
+        // Continue to the next item automatically once this one is reached.
         autocontinue: 1,
         param1: 0.0, // hold time
         param2: 0.0, // acceptance radius (vehicle default)
@@ -90,6 +103,8 @@ enum Reply {
     Ack(MavMissionResult),
 }
 
+/// Filters the raw stream down to mission-protocol replies from `target`.
+/// Everything else on the link (positions, other vehicles) is ignored.
 fn as_reply(target: u8, (header, msg): &RawMessage) -> Option<Reply> {
     if header.system_id != u32::from(target) {
         return None;
@@ -105,6 +120,9 @@ fn as_reply(target: u8, (header, msg): &RawMessage) -> Option<Reply> {
     }
 }
 
+/// Waits for the next relevant reply until `deadline`. `Ok(None)` means
+/// timeout. The deadline is absolute, so the 50 Hz stream of unrelated
+/// position messages cannot keep extending the wait.
 async fn next_reply(
     rx: &mut broadcast::Receiver<RawMessage>,
     target: u8,
@@ -118,6 +136,9 @@ async fn next_reply(
                     return Ok(Some(reply));
                 }
             }
+            // We were too slow and the broadcast dropped old messages. The
+            // dropped ones may include a reply; the timeout + re-send path
+            // recovers from that, so just log and keep reading.
             Ok(Err(RecvError::Lagged(n))) => {
                 tracing::warn!(skipped = n, "mission upload lagged behind telemetry");
             }
@@ -150,6 +171,8 @@ pub async fn upload_mission(
         target_component: AUTOPILOT_COMPONENT_ID,
     });
 
+    // `last_sent` is what we re-send on timeout: first the COUNT, later the
+    // most recent ITEM.
     let mut last_sent = count_msg;
     link.send(&last_sent).await?;
     let mut retries_left = cfg.retries;
@@ -170,12 +193,15 @@ pub async fn upload_mission(
                     .ok_or(UploadError::BadRequest(seq))?;
                 last_sent = mission_item(target_system, seq, wp);
                 link.send(&last_sent).await?;
+                // Progress was made, so the retry budget starts over.
                 retries_left = cfg.retries;
             }
             Some(Reply::Ack(MavMissionResult::MAV_MISSION_ACCEPTED)) => {
                 tracing::info!(target_system, count, "mission accepted");
                 return Ok(());
             }
+            // Any other ACK result (NO_SPACE, INVALID_PARAM, DENIED, ...) ends
+            // the transfer; the vehicle keeps its previous mission.
             Some(Reply::Ack(result)) => {
                 return Err(UploadError::Rejected(format!("{result:?}")));
             }

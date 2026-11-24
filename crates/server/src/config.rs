@@ -1,4 +1,9 @@
 //! Configuration from environment variables.
+//!
+//! Twelve-factor style: everything comes from the environment (or `.env` via
+//! Docker Compose), so the same binary runs locally, in Docker and in CI.
+//! Only `DATABASE_URL` is required; everything else has a default. Empty
+//! values count as unset, so `DEM_PATH=` in Compose disables the DEM.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -49,6 +54,10 @@ impl Config {
     }
 
     /// Reads the configuration from an arbitrary lookup (used by tests).
+    ///
+    /// Taking a lookup function instead of reading `std::env` directly lets
+    /// tests pass a `HashMap` without mutating the process environment
+    /// (which is shared by all test threads and `unsafe` in edition 2024).
     ///
     /// # Errors
     /// Returns [`ConfigError`] for missing or unparsable variables.

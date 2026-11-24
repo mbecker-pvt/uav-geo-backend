@@ -1,4 +1,9 @@
 //! Validated WGS84 positions.
+//!
+//! [`Position`] is the only coordinate type that crosses crate boundaries.
+//! It can only be built through [`Position::new`], so any value of this type
+//! is known to be in range. Decoded MAVLink messages, rows read from PostGIS
+//! and waypoints parsed from GeoJSON all go through it.
 
 use serde::Serialize;
 
@@ -34,6 +39,7 @@ impl Position {
     /// Returns [`PositionError`] if latitude or longitude is out of range, or
     /// any value is not finite.
     pub fn new(lat: f64, lon: f64, alt_m: f64) -> Result<Self, PositionError> {
+        // `contains` is false for NaN, so the range checks also reject NaN.
         if !(-90.0..=90.0).contains(&lat) {
             return Err(PositionError::Latitude(lat));
         }
@@ -47,8 +53,14 @@ impl Position {
     }
 
     /// Great-circle distance to `other` in metres (haversine, ignores altitude).
+    ///
+    /// Uses a spherical Earth, so the error is up to ~0.5 %. That is fine for
+    /// "how far apart are two points" checks; anything that needs real metres
+    /// (simplification, terrain sampling) projects to UTM instead.
     #[must_use]
     pub fn distance_m(&self, other: &Self) -> f64 {
+        // Haversine: a = sin²(Δφ/2) + cos φ1 · cos φ2 · sin²(Δλ/2),
+        // central angle = 2 · asin(√a).
         let (phi1, phi2) = (self.lat.to_radians(), other.lat.to_radians());
         let d_phi = phi2 - phi1;
         let d_lambda = (other.lon - self.lon).to_radians();

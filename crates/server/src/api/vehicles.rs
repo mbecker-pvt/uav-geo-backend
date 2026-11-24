@@ -14,6 +14,9 @@ use crate::state::AppState;
 
 /// `GET /health`: always 200 while the process runs; reports dependencies.
 pub async fn health(State(state): State<AppState>) -> Json<Value> {
+    // Liveness, not readiness: the service is useful (buffering, live feed)
+    // even without a database, so a down DB is reported, not a 503. A tight
+    // timeout keeps health checks fast during an outage.
     let db_up = matches!(
         tokio::time::timeout(Duration::from_secs(1), state.db.ping()).await,
         Ok(Ok(()))
@@ -31,6 +34,8 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
 /// `GET /vehicles`: database rows merged with live link state.
 pub async fn list(State(state): State<AppState>) -> ApiResult<Json<Value>> {
     let rows = state.db.list_vehicles().await?;
+    // Clone the small map and drop the read lock right away, so ingest is
+    // not blocked while we build JSON.
     let live = state.vehicles.read().await.clone();
     let mut out: Vec<Value> = rows
         .iter()
@@ -76,6 +81,8 @@ pub async fn track(
         .track(id, q.from, q.to, limit(q.limit, TRACK_LIMIT))
         .await?;
     let raw_count = points.len();
+    // Simplify after loading: RDP needs the whole line. `simplify_track`
+    // returns indices, so the kept points keep their timestamps.
     let points = match q.simplify_m {
         Some(tol) if tol > 0.0 => {
             let positions: Vec<_> = points.iter().map(|p| p.position).collect();
@@ -85,6 +92,9 @@ pub async fn track(
         }
         _ => points,
     };
+    // AGL is computed on read, not stored: loading a better DEM later
+    // improves all historic tracks too. Array parallel to the coordinates;
+    // `null` entries where the DEM has no data, absent without a DEM.
     let agl: Option<Vec<Option<f64>>> = state
         .terrain
         .as_ref()

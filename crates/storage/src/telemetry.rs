@@ -1,4 +1,11 @@
 //! Vehicles and positions.
+//!
+//! Write path: the server's write buffer calls [`Db::insert_positions`] with
+//! batches; heartbeats call [`Db::upsert_vehicle`]. Read path: `GET
+//! /vehicles`, `GET /vehicles/{id}/track` and `GET /positions?bbox=`.
+//!
+//! Coordinates go in with `ST_MakePoint(lon, lat, alt)` (note: x = lon first)
+//! and come out with `ST_X`/`ST_Y`/`ST_Z`, so Rust never has to parse WKB.
 
 use std::collections::BTreeMap;
 
@@ -42,6 +49,8 @@ pub struct TrackPoint {
     pub relative_alt_m: f64,
 }
 
+/// Postgres has no unsigned byte type, so ids are stored as `smallint` (with
+/// a CHECK 0..=255) and converted back here.
 pub(crate) fn system_id(v: i16) -> Result<u8> {
     u8::try_from(v).map_err(|_| StorageError::Corrupt(format!("system_id {v}")))
 }
@@ -62,6 +71,10 @@ fn track_point(row: &PgRow) -> Result<TrackPoint> {
 }
 
 /// Column list shared by track queries (a macro so SQL stays a literal).
+///
+/// sqlx 0.9 only accepts `&'static str` SQL (its `SqlSafeStr` guard against
+/// injection via `format!`). `concat!` with a macro builds the full query at
+/// compile time, so it is still a literal.
 macro_rules! track_columns {
     () => {
         "SELECT system_id, time, ST_Y(geom) AS lat, ST_X(geom) AS lon,          ST_Z(geom) AS alt, relative_alt_m FROM positions "
@@ -81,6 +94,8 @@ impl Db {
         autopilot: &str,
         seen_at: DateTime<Utc>,
     ) -> Result<()> {
+        // Upsert: the first heartbeat inserts, later ones update. `GREATEST`
+        // keeps `last_seen` monotonic if an older write lands late.
         sqlx::query(
             "INSERT INTO vehicles (system_id, component_id, vehicle_type, autopilot, first_seen, last_seen)
              VALUES ($1, $2, $3, $4, $5, $5)
@@ -111,13 +126,19 @@ impl Db {
         if rows.is_empty() {
             return Ok(0);
         }
+        // Newest time per vehicle in this batch, for the `vehicles` upsert.
         let mut last_seen: BTreeMap<u8, DateTime<Utc>> = BTreeMap::new();
         for r in rows {
             let e = last_seen.entry(r.system_id).or_insert(r.time);
             *e = (*e).max(r.time);
         }
 
+        // One transaction for the whole batch: either all rows are stored or
+        // none, so the write buffer can simply retry the same batch.
         let mut tx = self.pool().begin().await?;
+        // `positions.system_id` is a foreign key. If a position arrives before
+        // the vehicle's first heartbeat was written, create a placeholder row;
+        // the next heartbeat upsert fills in the real type.
         for (&id, &seen) in &last_seen {
             sqlx::query(
                 "INSERT INTO vehicles (system_id, component_id, vehicle_type, autopilot, first_seen, last_seen)
@@ -132,6 +153,8 @@ impl Db {
         }
 
         let mut inserted = 0;
+        // Multi-row `INSERT ... VALUES (...), (...), ...`: one round trip per
+        // chunk instead of one per row (50 Hz × several vehicles adds up).
         for chunk in rows.chunks(INSERT_CHUNK_ROWS) {
             let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
                 "INSERT INTO positions \
@@ -144,6 +167,9 @@ impl Db {
                 b.push_bind(i16::from(r.system_id))
                     .push_bind(r.time)
                     .push_bind(i64::from(r.time_boot_ms))
+                    // Geometry built in SQL from bound numbers; the
+                    // `_unseparated` variants avoid the comma that
+                    // `push_values` would otherwise insert between them.
                     .push("ST_SetSRID(ST_MakePoint(")
                     .push_bind_unseparated(r.position.lon)
                     .push_unseparated(", ")
@@ -202,6 +228,9 @@ impl Db {
     ) -> Result<Vec<TrackPoint>> {
         let rows = sqlx::query(concat!(
             track_columns!(),
+            // `$n IS NULL OR ...` makes the time filters optional without
+            // building different SQL strings. `id` breaks ties between rows
+            // with the same timestamp so the order is stable.
             "WHERE system_id = $1
                AND ($2::timestamptz IS NULL OR time >= $2)
                AND ($3::timestamptz IS NULL OR time <= $3)
@@ -231,6 +260,9 @@ impl Db {
     ) -> Result<Vec<TrackPoint>> {
         let rows = sqlx::query(concat!(
             track_columns!(),
+            // `&&` is the bounding-box overlap operator, answered by the GIST
+            // index. For points, "bbox overlaps envelope" is exactly "point
+            // inside envelope", so no slower ST_Within is needed.
             "WHERE geom && ST_MakeEnvelope($1, $2, $3, $4, 4326)
                AND ($5::smallint IS NULL OR system_id = $5)
                AND ($6::timestamptz IS NULL OR time >= $6)

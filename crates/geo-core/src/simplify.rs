@@ -1,4 +1,11 @@
 //! Track simplification (Ramer–Douglas–Peucker in metres).
+//!
+//! PX4 reports positions at up to 50 Hz, so a 10-minute flight is ~30 000
+//! points. RDP keeps only the points that deviate more than a tolerance from
+//! the straight line between their neighbours, which shrinks a typical track
+//! by 99 % while keeping every corner. Running RDP directly on lon/lat would
+//! make the tolerance "degrees" (and anisotropic, since a degree of longitude
+//! shrinks towards the poles), so we project to UTM first.
 
 use geo::{LineString, SimplifyIdx};
 
@@ -21,11 +28,15 @@ pub fn simplify_track(points: &[Position], tolerance_m: f64) -> Result<Vec<usize
     if points.len() < 3 || tolerance_m <= 0.0 || !tolerance_m.is_finite() {
         return Ok((0..points.len()).collect());
     }
+    // One zone for the whole track: a track crossing a zone border must not
+    // jump by hundreds of kilometres between two consecutive points.
     let (zone, north) = (zone_for(first.lon), first.lat >= 0.0);
     let coords = points
         .iter()
         .map(|p| to_utm_in_zone(p, zone, north).map(|u| (u.easting, u.northing)))
         .collect::<Result<Vec<_>, _>>()?;
+    // `simplify_idx` returns indices instead of new coordinates, so the caller
+    // can keep the original rows (timestamps, altitude, speed) of kept points.
     Ok(LineString::from(coords).simplify_idx(tolerance_m))
 }
 

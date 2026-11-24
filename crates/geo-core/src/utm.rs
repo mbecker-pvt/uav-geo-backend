@@ -3,6 +3,19 @@
 //! Accuracy is well below a millimetre within a zone (and its usual overlap),
 //! which is far below GNSS noise. The Norway/Svalbard zone exceptions are not
 //! applied: zones are always the regular 6° bands.
+//!
+//! UTM splits the Earth into 60 zones of 6° longitude. Inside a zone,
+//! coordinates are plain metres (easting, northing), so distances and
+//! tolerances become simple Euclidean maths. That is why simplification and
+//! terrain sampling along mission legs work in UTM.
+//!
+//! The formulas follow Karney (2011), "Transverse Mercator with an accuracy
+//! of a few nanometers", truncated after the n³ terms:
+//!
+//! 1. latitude → conformal latitude (via `t = sinh(ψ)`),
+//! 2. conformal coordinates → Gauss–Krüger `(ξ', η')`,
+//! 3. add the series terms `α₁..α₃` (forward) or subtract `β₁..β₃` (inverse),
+//! 4. scale by `k₀ · A` and add the false easting/northing.
 
 use serde::Serialize;
 
@@ -51,11 +64,17 @@ struct Coefficients {
     e_term: f64,
 }
 
+/// Computes the series coefficients. They only depend on the ellipsoid, so
+/// the cost (a few multiplications) is negligible compared to caching them.
 fn coefficients() -> Coefficients {
+    // Third flattening n = f / (2 - f): the series converge fast in n (≈ 0.0017).
     let n = F / (2.0 - F);
     let (n2, n3) = (n * n, n * n * n);
     Coefficients {
         big_a: A / (1.0 + n) * (1.0 + n2 / 4.0 + n2 * n2 / 64.0),
+        // A: radius of the rectifying sphere (meridian arc length per radian).
+        // α: forward (geographic → grid), β: inverse, δ: conformal → geodetic
+        // latitude.
         alpha: [
             n / 2.0 - 2.0 * n2 / 3.0 + 5.0 * n3 / 16.0,
             13.0 * n2 / 48.0 - 3.0 * n3 / 5.0,
@@ -84,6 +103,7 @@ pub fn zone_for(lon: f64) -> u8 {
     zone.min(60)
 }
 
+/// Longitude of the zone's centre line (zone 32 → 9°E).
 fn central_meridian(zone: u8) -> f64 {
     f64::from(zone) * 6.0 - 183.0
 }
@@ -114,11 +134,16 @@ pub fn to_utm_in_zone(p: &Position, zone: u8, north: bool) -> Result<Utm, UtmErr
     let phi = p.lat.to_radians();
     let dlambda = (p.lon - central_meridian(zone)).to_radians();
 
+    // Step 1: t = tan(conformal latitude) = sinh(isometric latitude)
+    // (ellipsoid → conformal sphere).
     let sin_phi = phi.sin();
     let t = (sin_phi.atanh() - c.e_term * (c.e_term * sin_phi).atanh()).sinh();
+    // Step 2: Gauss–Krüger coordinates on the sphere, relative to the
+    // central meridian.
     let xi_p = t.atan2(dlambda.cos());
     let eta_p = (dlambda.sin() / (1.0 + t * t).sqrt()).atanh();
 
+    // Step 3: series correction back to the ellipsoid.
     let mut easting = eta_p;
     let mut northing = xi_p;
     for (j, alpha) in (1_u8..).zip(c.alpha) {
@@ -126,6 +151,9 @@ pub fn to_utm_in_zone(p: &Position, zone: u8, north: bool) -> Result<Utm, UtmErr
         easting += alpha * (k * xi_p).cos() * (k * eta_p).sinh();
         northing += alpha * (k * xi_p).sin() * (k * eta_p).cosh();
     }
+    // Step 4: scale to metres. False easting keeps values positive west of
+    // the central meridian; the false northing does the same south of the
+    // equator.
     Ok(Utm {
         zone,
         north,
@@ -142,6 +170,9 @@ pub fn from_utm(u: &Utm, alt_m: f64) -> Result<Position, UtmError> {
     if !(1..=60).contains(&u.zone) {
         return Err(UtmError::Zone(u.zone));
     }
+    // The inverse runs the forward steps backwards: remove false origin and
+    // scale, subtract the β series, then convert conformal → geodetic latitude
+    // with the δ series.
     let c = coefficients();
     let n0 = if u.north { 0.0 } else { N0_SOUTH };
     let xi = (u.northing - n0) / (K0 * c.big_a);
@@ -161,6 +192,7 @@ pub fn from_utm(u: &Utm, alt_m: f64) -> Result<Position, UtmError> {
     }
     let lambda = central_meridian(u.zone).to_radians() + eta_p.sinh().atan2(xi_p.cos());
     let mut lon = lambda.to_degrees();
+    // Zones 1 and 60 border the antimeridian; wrap into -180..=180.
     if lon > 180.0 {
         lon -= 360.0;
     } else if lon < -180.0 {

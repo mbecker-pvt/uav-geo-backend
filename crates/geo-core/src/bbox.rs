@@ -1,4 +1,8 @@
 //! Axis-aligned WGS84 bounding boxes.
+//!
+//! Parsed from the `bbox=minLon,minLat,maxLon,maxLat` query parameter. The
+//! database query uses the values with `ST_MakeEnvelope` (index-backed); the
+//! WebSocket filter uses [`BBox::contains`] in memory for each live position.
 
 use std::str::FromStr;
 
@@ -66,6 +70,7 @@ impl FromStr for BBox {
             .map(|v| v.trim().parse::<f64>())
             .collect::<Result<_, _>>()
             .map_err(|_| BBoxError::Format)?;
+        // Slice pattern: exactly four numbers, anything else is a format error.
         let [min_lon, min_lat, max_lon, max_lat] = values[..] else {
             return Err(BBoxError::Format);
         };

@@ -1,4 +1,10 @@
 //! API error type rendered as JSON.
+//!
+//! Handlers return `ApiResult<T>` and use `?`. The `From<StorageError>` impl
+//! below decides the HTTP status for database failures, so no handler has to
+//! think about it: "database unreachable / not set up yet" → 503 (retry
+//! later), anything else → 500 (a bug), and details only go to the log, not
+//! to the client.
 
 use axum::Json;
 use axum::http::StatusCode;

@@ -1,4 +1,8 @@
 //! Binary entry point.
+//!
+//! Deliberately tiny: logging setup, config, start, wait for Ctrl-C/SIGTERM,
+//! shut down. All logic is in the library so the end-to-end tests run
+//! exactly the same code path in-process.
 
 use tracing_subscriber::EnvFilter;
 
@@ -17,6 +21,8 @@ async fn main() -> anyhow::Result<()> {
 
     let running = server::start(config).await?;
     server::shutdown_signal().await;
+    // Cancelling the token starts the ordered shutdown (see `app.rs`);
+    // `wait` returns once the final buffer flush is done.
     running.shutdown.cancel();
     running.wait().await;
     Ok(())

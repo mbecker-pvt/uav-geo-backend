@@ -1,4 +1,18 @@
 //! Ingest task: telemetry events → live broadcast, write buffer, vehicle state.
+//!
+//! The single consumer of decoded telemetry. For each event:
+//!
+//! - **Position** → compute AGL, update the in-memory vehicle status, push a
+//!   `LiveMessage::Position` to WebSocket clients, and hand a `PositionRow`
+//!   to the write buffer for PostGIS.
+//! - **Heartbeat** → feed the [`LinkMonitor`], update `armed`, and upsert the
+//!   vehicle row (in the background, rate-limited).
+//!
+//! A 500 ms timer additionally asks the monitor for vehicles whose heartbeat
+//! timed out, since "no message arrived" can only be noticed by a clock.
+//!
+//! Nothing here awaits the database directly: a slow PostGIS must never
+//! delay the live feed.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -25,8 +39,10 @@ pub async fn run_ingest(
     let mut monitor = LinkMonitor::new(link_timeout);
     let last_upsert: UpsertLog = Arc::default();
     let mut check = tokio::time::interval(Duration::from_millis(500));
+    // After a stall, run one check instead of a burst of catch-up ticks.
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        // Wait for whichever comes first: shutdown, an event, or the timer.
         tokio::select! {
             () = cancel.cancelled() => break,
             event = events.recv() => match event {
@@ -38,6 +54,9 @@ pub async fn run_ingest(
                     maybe_upsert_vehicle(&state, &hb, &last_upsert);
                 }
                 Some(TelemetryEvent::Position(p)) => {
+                    // Live first (low latency), then storage. `send` only
+                    // waits if the writer's channel is full, which means the
+                    // writer itself is stuck, not merely the database.
                     handle_position(&state, &p).await;
                     if rows.send(to_row(&p)).await.is_err() {
                         tracing::warn!("write buffer closed, stopping ingest");
@@ -80,6 +99,8 @@ async fn handle_position(state: &AppState, p: &PositionReport) {
         heading_deg: p.heading_deg,
         velocity_ned_mps: p.velocity_ned_mps,
     };
+    // Scoped block: release the write lock before broadcasting, so readers
+    // (`GET /vehicles`) are blocked as briefly as possible.
     {
         let mut vehicles = state.vehicles.write().await;
         let v = vehicles.entry(p.system_id).or_insert(VehicleStatus {
@@ -125,6 +146,10 @@ async fn set_armed(state: &AppState, hb: &Heartbeat) {
 }
 
 /// Last successful vehicle upsert per system id: (time, type key).
+///
+/// A `std` (not `tokio`) mutex: it is only held for a map lookup/insert and
+/// never across an `.await`, which is the case where a sync mutex is the
+/// faster and simpler choice.
 type UpsertLog = Arc<Mutex<BTreeMap<u8, (std::time::Instant, String)>>>;
 
 /// Upserts the vehicle in the background so a slow or down database never
@@ -132,6 +157,8 @@ type UpsertLog = Arc<Mutex<BTreeMap<u8, (std::time::Instant, String)>>>;
 /// (a failure is retried on the next heartbeat), immediate on type changes.
 fn maybe_upsert_vehicle(state: &AppState, hb: &Heartbeat, log: &UpsertLog) {
     let now = std::time::Instant::now();
+    // The "identity" of the vehicle row; if it changes (e.g. a different
+    // airframe reusing system id 1), write immediately.
     let key = format!("{}/{}/{}", hb.component_id, hb.vehicle_type, hb.autopilot);
     if let Some((at, prev)) = log.lock().expect("upsert log poisoned").get(&hb.system_id)
         && *prev == key
@@ -151,6 +178,9 @@ fn maybe_upsert_vehicle(state: &AppState, hb: &Heartbeat, log: &UpsertLog) {
             )
             .await
         {
+            // Only remember success. Recording the attempt instead would
+            // skip retries for 10 s, which is the bug the e2e test found: the
+            // first heartbeat arrived before the migrations had run.
             Ok(()) => {
                 log.lock()
                     .expect("upsert log poisoned")

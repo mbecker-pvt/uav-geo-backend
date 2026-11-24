@@ -3,6 +3,26 @@
 //! Queries are built at runtime (no compile-time checked macros), so building
 //! the workspace never needs a database. Schema lives in `migrations/` and is
 //! embedded into the binary.
+//!
+//! Schema overview:
+//!
+//! | Table | Content |
+//! |---|---|
+//! | `vehicles` | one row per MAVLink system id: type, autopilot, first/last seen |
+//! | `positions` | every received position, `geom geometry(PointZ, 4326)` = lon, lat, alt AMSL |
+//! | `geofences` | polygons; a partial unique index allows at most one `active` |
+//! | `missions` | validated waypoints (`MultiPointZ`, order preserved) + upload status |
+//!
+//! `positions` has two indexes for the two query shapes: B-tree
+//! `(system_id, time)` for "track of vehicle X between T1 and T2", and GIST
+//! on `geom` for "everything inside this bounding box".
+//!
+//! **Never edit an applied migration file**, not even its comments: sqlx
+//! stores a checksum per migration and refuses to start against a database
+//! where a migration "was modified". Add a new numbered file instead.
+//!
+//! Only the `server` crate uses this crate. Its write buffer calls
+//! [`Db::insert_positions`], its API handlers call the read functions.
 
 mod missions;
 mod telemetry;
@@ -18,6 +38,10 @@ pub use telemetry::{PositionRow, TrackPoint, VehicleRow};
 pub static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 /// Postgres bind parameter limit is 65 535; rows per multi-row insert.
+///
+/// Each position row binds 11 parameters, so 1 000 rows = 11 000 binds: well
+/// below the limit, and large enough that one statement covers 20 s of
+/// 50 Hz telemetry.
 const INSERT_CHUNK_ROWS: usize = 1_000;
 
 /// Storage errors.
@@ -47,6 +71,9 @@ impl Db {
     /// # Errors
     /// Returns an error if the URL is invalid.
     pub fn connect_lazy(url: &str, max_connections: u32) -> Result<Self> {
+        // A short acquire timeout turns "database down" into a fast error
+        // (→ 503 for the API, retry for the write buffer) instead of hanging
+        // requests for the sqlx default of 30 s.
         let pool = PgPoolOptions::new()
             .max_connections(max_connections)
             .acquire_timeout(Duration::from_secs(3))

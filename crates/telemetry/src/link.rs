@@ -1,4 +1,20 @@
 //! Async MAVLink connection shared by the receive loop and outgoing protocols.
+//!
+//! Data flow:
+//!
+//! ```text
+//!  UDP socket ──recv──▶ run() ──decode──▶ mpsc<TelemetryEvent> ──▶ server ingest
+//!                          └──────raw────▶ broadcast<RawMessage> ──▶ upload_mission
+//!  upload_mission ──send()──▶ UDP socket
+//! ```
+//!
+//! Only one task may read from the socket, otherwise messages would be split
+//! randomly between readers. So the mission upload does not read itself; it
+//! subscribes to the raw broadcast that the single receive loop feeds.
+//!
+//! With `udpin:` the `mavlink` crate replies to the address of the last
+//! received packet, so sending works on the same socket without knowing the
+//! vehicle's address in advance.
 
 use std::sync::Arc;
 
@@ -16,6 +32,9 @@ pub const GCS_SYSTEM_ID: u8 = 255;
 pub const GCS_COMPONENT_ID: u8 = 190;
 
 /// Capacity of the raw message broadcast used by request/response protocols.
+///
+/// At ~100 messages/s from PX4 this is a few seconds of backlog; a slower
+/// subscriber gets `Lagged` and skips ahead, the receive loop never waits.
 const RAW_CHANNEL_CAPACITY: usize = 256;
 
 /// A raw received message with its header.
@@ -82,6 +101,8 @@ impl MavLink {
     /// # Errors
     /// Returns [`LinkError::Send`] on I/O errors.
     pub async fn send(&self, msg: &MavMessage) -> Result<(), LinkError> {
+        // We identify as a ground station. The sequence number is only used
+        // by receivers to estimate packet loss, so a constant 0 is harmless.
         let header = MavHeader {
             system_id: u32::from(GCS_SYSTEM_ID),
             component_id: GCS_COMPONENT_ID,
@@ -100,18 +121,24 @@ impl MavLink {
     pub async fn run(&self, tx: mpsc::Sender<TelemetryEvent>, cancel: CancellationToken) {
         tracing::info!("MAVLink receive loop started");
         loop {
+            // `select!` makes the blocking-looking `recv` cancellable: on
+            // shutdown we stop waiting for the next packet immediately.
             let received = tokio::select! {
                 () = cancel.cancelled() => break,
                 r = self.conn.recv() => r,
             };
             let (header, msg) = match received {
                 Ok(m) => m,
+                // Corrupt packets / CRC errors / unknown message ids are
+                // normal on a radio link; skip them and keep listening.
                 Err(e) => {
                     tracing::debug!(error = %e, "MAVLink read error");
                     continue;
                 }
             };
             if let Some(event) = decode(&header, &msg, Utc::now()) {
+                // `mpsc` is bounded: if ingest falls behind, this awaits
+                // (backpressure) instead of growing memory. Still cancellable.
                 let sent = tokio::select! {
                     () = cancel.cancelled() => break,
                     r = tx.send(event) => r,

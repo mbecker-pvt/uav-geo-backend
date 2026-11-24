@@ -8,6 +8,16 @@
 //!   failing database loses nothing within the capacity.
 //! * Failed inserts back off exponentially up to `max_backoff`.
 //! * On shutdown, a final flush runs with a deadline.
+//!
+//! Why batch at all: one `INSERT` per position at 50 Hz is 50 round trips per
+//! second per vehicle. Collecting rows for up to 500 ms and inserting them as
+//! one multi-row statement cuts that to 2, and the same mechanism gives
+//! outage tolerance for free: while the database is down the queue simply
+//! grows instead of being flushed.
+//!
+//! The buffer is generic over [`PositionSink`], so the unit tests drive it
+//! with a fake sink that fails on demand, using tokio's paused clock instead
+//! of real sleeps.
 
 use std::collections::VecDeque;
 use std::future::Future;
@@ -63,6 +73,10 @@ impl BufferConfig {
 }
 
 /// Counters shared with the health endpoint.
+///
+/// Atomics instead of a mutex: the writer updates them on every flush and
+/// `/health` reads them, and none of them must be consistent with each
+/// other, so `Relaxed` ordering is enough.
 #[derive(Debug, Default)]
 pub struct BufferStats {
     queued: AtomicUsize,
@@ -96,9 +110,14 @@ impl BufferStats {
 struct WriteBuffer<S> {
     sink: S,
     cfg: BufferConfig,
+    /// Oldest row at the front. `VecDeque` makes both "drop oldest" and
+    /// "append newest" O(1).
     queue: VecDeque<PositionRow>,
     stats: Arc<BufferStats>,
+    /// Wait before the next retry; doubles after each failure.
     backoff: Duration,
+    /// `Some` while the database is failing: no write is attempted before
+    /// this instant, so rows keep queueing without hammering the database.
     retry_at: Option<Instant>,
 }
 
@@ -107,6 +126,8 @@ impl<S: PositionSink> WriteBuffer<S> {
         if self.queue.len() >= self.cfg.capacity {
             self.queue.pop_front();
             let dropped = self.stats.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+            // Log at 1, 2, 4, 8, ... drops: visible, but not 50 lines per
+            // second during a long outage.
             if dropped.is_power_of_two() {
                 tracing::warn!(dropped, "write buffer full, dropping oldest positions");
             }
@@ -122,8 +143,12 @@ impl<S: PositionSink> WriteBuffer<S> {
         }
         while !self.queue.is_empty() {
             let n = self.queue.len().min(self.cfg.batch_size);
+            // A `VecDeque` may wrap around internally; `make_contiguous`
+            // rearranges it so the first `n` rows can be passed as a slice.
             let batch = &self.queue.make_contiguous()[..n];
             match self.sink.insert(batch).await {
+                // Remove rows only after the insert succeeded: this is the
+                // "nothing lost during an outage" guarantee.
                 Ok(()) => {
                     self.queue.drain(..n);
                     self.stats.written.fetch_add(n as u64, Ordering::Relaxed);
@@ -175,6 +200,8 @@ pub async fn run_writer<S: PositionSink>(
             row = rx.recv() => match row {
                 Some(row) => {
                     buf.push(row);
+                    // A full batch is written right away instead of waiting
+                    // for the next tick (bounded latency under high load).
                     if buf.queue.len() >= cfg.batch_size {
                         buf.flush().await;
                     }
@@ -189,6 +216,9 @@ pub async fn run_writer<S: PositionSink>(
     while let Ok(row) = rx.try_recv() {
         buf.push(row);
     }
+    // Ignore a pending backoff: on shutdown, try immediately. If the database
+    // is still down, keep retrying (with backoff) until the deadline, after
+    // which the remaining rows are reported as lost.
     buf.retry_at = None;
     let pending = buf.queue.len();
     let result = tokio::time::timeout(cfg.shutdown_deadline, async {

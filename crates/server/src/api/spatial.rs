@@ -1,4 +1,8 @@
 //! Spatial queries, coordinate conversion and terrain lookup.
+//!
+//! `/positions` is the PostGIS spatial query (GIST index). The `/convert/*`
+//! and `/terrain` endpoints expose `geo-core` and the DEM directly; they are
+//! small, but handy for checking values by hand or from a map client.
 
 use axum::Json;
 use axum::extract::{Query, State};
@@ -49,6 +53,8 @@ pub struct LatLon {
     lon: f64,
 }
 
+/// Validates query coordinates through [`Position::new`] (altitude unused),
+/// so out-of-range input becomes a 400 instead of a nonsense result.
 fn position(q: &LatLon) -> ApiResult<Position> {
     Position::new(q.lat, q.lon, 0.0).map_err(|e| ApiError::bad_request(e.to_string()))
 }

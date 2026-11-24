@@ -1,4 +1,13 @@
 //! Geofences and missions.
+//!
+//! The mission workflow is split into two requests on purpose:
+//!
+//! 1. `POST /missions` validates and stores (fast, synchronous, 201/422).
+//! 2. `POST /missions/{id}/upload` sends the stored mission to the vehicle
+//!    (slow, depends on the radio link, 202 + poll).
+//!
+//! Only missions that passed validation exist in the database, so step 2
+//! cannot upload an unchecked route.
 
 use std::sync::Arc;
 
@@ -19,6 +28,8 @@ use crate::state::AppState;
 /// `POST /geofences`: GeoJSON `Polygon` or `Feature`; becomes the active fence.
 pub async fn create_geofence(
     State(state): State<AppState>,
+    // Taking `Result<Json, JsonRejection>` instead of `Json` lets us turn
+    // malformed JSON into our own error format instead of axum's plain text.
     body: Result<Json<Value>, JsonRejection>,
 ) -> ApiResult<(StatusCode, Json<Value>)> {
     let Json(body) = body.map_err(|e| json_rejection(&e))?;
@@ -83,6 +94,8 @@ pub async fn create(
         waypoints,
     };
 
+    // Without a fence or DEM the corresponding check is skipped; `checks` is
+    // echoed in the response so the client can see what was (not) verified.
     let fence = current_geofence(&state).await?;
     let rules = MissionRules {
         geofence: fence.as_ref().map(|(_, f)| f.as_ref()),
@@ -95,6 +108,7 @@ pub async fn create(
         "terrain": state.terrain.is_some(),
         "min_agl_m": state.min_agl_m,
     });
+    // 422 (not 400): the JSON is well-formed, but the mission breaks a rule.
     if let Err(violations) = mission.validate(&rules) {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -104,6 +118,8 @@ pub async fn create(
         .with_details(json!({ "violations": violations, "checks": checks })));
     }
 
+    // Read back what was stored, so the response shows exactly what an
+    // upload will send (after the WKT round trip), not the request echo.
     let id = state.db.insert_mission(&mission).await?;
     let stored = state
         .db
@@ -143,6 +159,8 @@ pub async fn upload(
         .get_mission(id)
         .await?
         .ok_or_else(|| ApiError::not_found("mission not found"))?;
+    // Atomic status switch; a second concurrent request gets 409 instead of
+    // starting a parallel upload that would confuse the vehicle.
     if !state.db.begin_mission_upload(id).await? {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -150,6 +168,9 @@ pub async fn upload(
             "an upload of this mission is already running",
         ));
     }
+    // The upload takes seconds (one round trip per waypoint, plus retries).
+    // Run it detached from the HTTP request, which returns 202 at once; the
+    // task records the outcome in the mission's status when it finishes.
     let db = state.db.clone();
     tokio::spawn(async move {
         let result = upload_mission(

@@ -2,6 +2,17 @@
 //!
 //! Run with `cargo test -p server --features db-tests` and `DATABASE_URL` set
 //! (e.g. `docker compose up -d postgis`). Each test uses its own database.
+//!
+//! The "fake vehicle" is a plain UDP socket that sends hand-built MAVLink
+//! heartbeats and positions to the service and answers its mission requests,
+//! just like PX4 would. Scenarios:
+//!
+//! - `full_flow`: fly a short track, then check WebSocket, track,
+//!   simplification, bbox, UTM conversion, terrain, mission 422/201, upload
+//!   and link loss once the fake vehicle stops sending.
+//! - `buffers_while_database_is_missing`: start the service *before* its
+//!   database exists, send positions, create the database, and check that
+//!   every buffered position is written, in order.
 #![cfg(feature = "db-tests")]
 
 use std::collections::HashMap;
