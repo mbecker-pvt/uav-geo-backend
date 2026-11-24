@@ -1,13 +1,26 @@
 [package]
 name = "telemetry"
-description = "MAVLink telemetry ingestion (week 2)"
+description = "MAVLink telemetry ingestion and mission upload"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 geo-core.workspace = true
+chrono.workspace = true
+mavlink.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+geo-core.workspace = true
+mavlink.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
