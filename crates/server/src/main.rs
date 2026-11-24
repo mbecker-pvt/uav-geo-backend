@@ -1,14 +1,23 @@
-//! Entry point. Week 3 replaces this with an `axum` server.
+//! Binary entry point.
 
-fn main() {
-    match telemetry::from_global_position_int(481_086_000, 112_939_000, 560_250) {
-        Ok(p) => println!(
-            "uav-geo-backend {}: sample position {:.4}, {:.4} @ {:.1} m",
-            env!("CARGO_PKG_VERSION"),
-            p.lat,
-            p.lon,
-            p.alt_m
-        ),
-        Err(e) => eprintln!("error: {e}"),
-    }
+use tracing_subscriber::EnvFilter;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .init();
+    let config = server::Config::from_env()?;
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "starting uav-geo-backend"
+    );
+
+    let running = server::start(config).await?;
+    server::shutdown_signal().await;
+    running.shutdown.cancel();
+    running.wait().await;
+    Ok(())
 }
