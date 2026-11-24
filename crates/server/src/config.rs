@@ -11,7 +11,8 @@ pub struct Config {
     pub database_url: String,
     /// `MAVLINK_ADDR`, default `udpin:0.0.0.0:14550`.
     pub mavlink_addr: String,
-    /// `HTTP_ADDR`, default `0.0.0.0:8080`.
+    /// `HTTP_ADDR`, default `127.0.0.1:8080` (loopback only; the Docker image
+    /// sets `0.0.0.0:8080`).
     pub http_addr: SocketAddr,
     /// `DEM_PATH`: GeoTIFF file or directory (optional).
     pub dem_path: Option<PathBuf>,
@@ -73,7 +74,7 @@ impl Config {
         Ok(Self {
             database_url: get("DATABASE_URL").ok_or(ConfigError::Missing("DATABASE_URL"))?,
             mavlink_addr: get("MAVLINK_ADDR").unwrap_or_else(|| "udpin:0.0.0.0:14550".to_owned()),
-            http_addr: parse(&get, "HTTP_ADDR", SocketAddr::from(([0, 0, 0, 0], 8080)))?,
+            http_addr: parse(&get, "HTTP_ADDR", SocketAddr::from(([127, 0, 0, 1], 8080)))?,
             dem_path: path("DEM_PATH"),
             geofence_path: path("GEOFENCE_PATH"),
             min_agl_m: parse(&get, "MIN_AGL_M", 30.0)?,
@@ -102,7 +103,7 @@ mod tests {
     #[test]
     fn applies_defaults() {
         let c = Config::from_lookup(env(&[("DATABASE_URL", "postgres://x")])).unwrap();
-        assert_eq!(c.http_addr.port(), 8080);
+        assert_eq!(c.http_addr, SocketAddr::from(([127, 0, 0, 1], 8080)));
         assert_eq!(c.mavlink_addr, "udpin:0.0.0.0:14550");
         assert!(c.dem_path.is_none());
         assert!((c.min_agl_m - 30.0).abs() < f64::EPSILON);

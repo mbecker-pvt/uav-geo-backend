@@ -4,7 +4,7 @@ Working notes for implementing the README feature list (roadmap weeks 2–6).
 Full plan: milestones M0–M5 (housekeeping → ingestion → PostGIS/API →
 spatial/terrain → missions/robustness → tests/compose/docs).
 
-Nothing is committed yet; commit per milestone only when asked.
+Committed on branch `feat/weeks-2-6` (see "Commits" below).
 
 ## Status
 
@@ -63,14 +63,27 @@ Gotchas found:
   Compose `px4-app` therefore uses `command: ["app", "app"]`.
 - Arming needs `NAV_DLL_ACT 0` + `COM_RC_IN_MODE 4` (backend sends no GCS heartbeat). Commands via
   `$FIRMWARE_DIR/build/bin/px4-param` / `px4-commander` (see README).
-- Host mode (`sim` profile + backend on Windows) was **not** verified: the host backend hung after binding UDP
-  and became an unkillable zombie holding UDP 14550 (same Windows issue as the hung test processes). A reboot
-  clears it. Docker forwards PX4 traffic to `127.0.0.1:14550` on the host correctly.
+- **Windows: binding TCP on `0.0.0.0` hangs** (2026-11-24, reproducible after reboot). `TcpListener::bind`
+  never returns, 0 % CPU, and the process becomes unkillable while still holding its sockets (and locking its
+  `.exe`). Binding `127.0.0.1` works; UDP on `0.0.0.0` works. Most likely Windows Firewall / a security tool
+  holding `listen()` until someone answers its "allow network access" prompt. Fix: `HTTP_ADDR` now defaults to
+  `127.0.0.1:8080` (the Docker image sets `0.0.0.0:8080` itself). The old "unkillable test processes" were
+  probably the same thing.
+- Host mode (`sim` profile + `cargo run -p server`) verified on 2026-11-24 with the loopback default: PX4 in
+  Docker reaches the Windows backend, vehicle `connected` with live positions. (Run on port 14541 through an
+  extra `px4-mavlink start ... -o 14541` because zombies held 14550/14540; a reboot frees them.)
+
+## Commits
+
+Branch `feat/weeks-2-6` (pushed, not merged), 8 layered commits + fixes. Each commit passes
+`cargo clippy --workspace --all-targets --all-features -- -D warnings` on its own (checked in a worktree).
+CI only runs on pull requests and pushes to `main`, so it runs once a PR is opened.
 
 ## Next steps
 
-1. Reboot (clears the zombie processes), then optionally re-check the `sim` profile with `cargo run -p server`.
-2. Commit per milestone when asked; push and check CI (new `docker` job, PostGIS service).
+1. Open the PR (`https://github.com/mbecker-pvt/uav-geo-backend/pull/new/feat/weeks-2-6`) and check CI
+   (`gh` is not installed here). Merge when green.
+2. Reboot to free the zombie processes (UDP 14550/14540).
 3. Optional: demo GIF / small web map, OpenAPI (utoipa), GCS heartbeat from the backend (so PX4 arms without param changes).
 
 ## Infra

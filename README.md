@@ -104,7 +104,7 @@ more `.tif` files into `data/dem/` (git-ignored) and set `DEM_PATH=data/dem`.
 |---|---|---|
 | `DATABASE_URL` | *(required)* | PostgreSQL/PostGIS connection string |
 | `MAVLINK_ADDR` | `udpin:0.0.0.0:14550` | MAVLink endpoint (`udpin`, `udpout`, `tcpout`, `serial`) |
-| `HTTP_ADDR` | `0.0.0.0:8080` | HTTP listen address |
+| `HTTP_ADDR` | `127.0.0.1:8080` | HTTP listen address (the Docker image uses `0.0.0.0:8080`) |
 | `DEM_PATH` | – | GeoTIFF file or directory of tiles |
 | `GEOFENCE_PATH` | – | GeoJSON polygon used when no geofence is active in the database |
 | `MIN_AGL_M` | `30` | Minimum height above ground for missions |
