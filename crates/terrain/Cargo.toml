@@ -1,0 +1,16 @@
+[package]
+name = "terrain"
+description = "DEM raster (GeoTIFF) terrain elevation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+geo-core.workspace = true
+thiserror.workspace = true
+tiff.workspace = true
+
+[lints]
+workspace = true
