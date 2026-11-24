@@ -38,8 +38,32 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    # `--all-features` enables the `db-tests` (PostGIS + end-to-end) tests.
+    services:
+      postgis:
+        image: postgis/postgis:17-3.5
+        env:
+          POSTGRES_USER: uav
+          POSTGRES_PASSWORD: uav
+          POSTGRES_DB: uav
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U uav -d uav"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      DATABASE_URL: postgres://uav:uav@127.0.0.1:5432/uav
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-features --locked
+
+  docker:
+    name: docker image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t uav-geo-backend:ci .

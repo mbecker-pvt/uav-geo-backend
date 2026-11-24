@@ -1,0 +1,73 @@
+# Local stack.
+#   docker compose up -d postgis               database only (dev / tests)
+#   docker compose --profile sim up -d         + PX4 SITL -> backend on the host (cargo run)
+#   docker compose --profile full up --build   + PX4 SITL + backend container
+#
+# Optional DEM / geofence for the backend container: put files into ./data and
+# set APP_DEM_PATH=/data/dem (directory or .tif) / APP_GEOFENCE_PATH=/data/geofence.geojson.
+services:
+  postgis:
+    image: postgis/postgis:17-3.5
+    environment:
+      POSTGRES_USER: uav
+      POSTGRES_PASSWORD: uav
+      POSTGRES_DB: uav
+    ports:
+      - "${POSTGIS_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U uav -d uav"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # PX4 SITL (Gazebo, headless). Without arguments it sends MAVLink to
+  # host.docker.internal:14550, i.e. a backend started with `cargo run`.
+  px4:
+    profiles: [sim]
+    image: jonasvautherin/px4-gazebo-headless:1.17.0
+    environment: &px4-home
+      # Start next to Munich (matches the README examples).
+      PX4_HOME_LAT: "48.1086"
+      PX4_HOME_LON: "11.2939"
+      PX4_HOME_ALT: "560"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    tty: true
+    stdin_open: true
+
+  # Same simulator, sending to the backend container instead.
+  px4-app:
+    profiles: [full]
+    image: jonasvautherin/px4-gazebo-headless:1.17.0
+    environment: *px4-home
+    # Two arguments (API host, GCS host): with only one, the image's
+    # entrypoint sets just the 14540 target and 14550 still goes to the host.
+    command: ["app", "app"]
+    depends_on: [app]
+    tty: true
+    stdin_open: true
+
+  app:
+    profiles: [full]
+    build: .
+    environment:
+      DATABASE_URL: postgres://uav:uav@postgis:5432/uav
+      MAVLINK_ADDR: udpin:0.0.0.0:14550
+      HTTP_ADDR: 0.0.0.0:8080
+      DEM_PATH: ${APP_DEM_PATH:-}
+      GEOFENCE_PATH: ${APP_GEOFENCE_PATH:-}
+      MIN_AGL_M: ${MIN_AGL_M:-30}
+      RUST_LOG: ${RUST_LOG:-info}
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/data:ro
+    depends_on:
+      postgis:
+        condition: service_healthy
+    stop_grace_period: 15s
+
+volumes:
+  pgdata:
